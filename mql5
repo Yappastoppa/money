@@ -1,0 +1,553 @@
+#include <Tools\DateTime.mqh>
+#include <Indicators\Trend.mqh>
+#include <CommonFunctions.mqh>
+#include "trendFinder.mqh"
+#include "DB_patternFinder.mqh"
+#include "DT_patternFinder.mqh"
+
+input int FastMAPeriod = 10;
+input int SlowMAPeriod = 20;
+input int RSI_Period = 14;
+input ENUM_TIMEFRAMES Timeframe = PERIOD_H1;
+input ENUM_APPLIED_PRICE AppliedPrice = PRICE_CLOSE;
+input int StartHour = 8;
+input int EndHour = 23;
+
+// Add new inputs for StopLoss, TakeProfit, and TrailingStop
+input double StopLoss = 3;
+input double TakeProfit = 10;
+input int ProfitStopLoss = 20; // Profit Stop Loss in points
+input double TrailingStop = 15;
+input int MA_Period = 50;
+
+input int BBPeriod = 20;
+input double BBDeviation = 2;
+
+input int ATR_Period = 7; // Period for ATR calculation
+input double ATR_Factor = 1.2; // Multiplier for ATR to determine breakout points
+
+// Global variables
+int FastMAHandle, SlowMAHandle, RSIHandle;
+string current_trend = "";
+string previous_trend = "";
+CiADX adx;
+int BBHandle;
+double BBUpper[], BBLower[], BBMiddle[];
+int ATRHandle;
+double ATR[];
+double MinRSI = 100;
+double PrevATR = 0;
+
+// Global variables for Scalping strategy
+int MA_Handle;
+double MA[];
+double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+// Add input for Lots
+input double StopLossMultiplier = 2; // Multiplier for StopLoss based on ATR
+input double TakeProfitMultiplier = 10; // Multiplier for TakeProfit based on ATR
+input double RiskPercentage = 1; // Risk percentage of account balance
+input double StopLossPips = 10; // Stop loss in pips
+input double LotSize = 0.40; // The lot size for each trade
+input int MagicNumber = 12345; // Unique identifier for the EA's trades
+
+// Declare the 'current_hour' variable
+datetime current_hour;
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+bool IsTradeAllowed()
+  {
+// Check if trading is allowed for the current symbol
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE))
+     {
+      Print("Trading is not allowed for this symbol: ", _Symbol);
+      return false;
+     }
+
+// Check if trading is allowed for the current account
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+     {
+      Print("Trading is not allowed for this account.");
+      return false;
+     }
+
+// Check if trading is allowed for the current Expert Advisor
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+     {
+      Print("Trading is not allowed for this Expert Advisor.");
+      return false;
+     }
+
+// If all the above conditions are met, trading is allowed
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+bool IsTradeAlreadyOpen(ENUM_ORDER_TYPE order_type)
+  {
+   for(int i = 0; i < PositionsTotal(); i++)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+        {
+         if(PositionGetInteger(POSITION_TYPE) == order_type && _Symbol == PositionGetString(POSITION_SYMBOL))
+           {
+            return true;
+           }
+        }
+     }
+   return false;
+  }
+
+// OnInit()
+void OnInit()
+  {
+   FastMAHandle = iMA(_Symbol, Timeframe, FastMAPeriod, 0, MODE_EMA, AppliedPrice);
+   SlowMAHandle = iMA(_Symbol, Timeframe, SlowMAPeriod, 0, MODE_EMA, AppliedPrice);
+   RSIHandle = iRSI(_Symbol, Timeframe, RSI_Period, AppliedPrice);
+// Initialize Moving Average handle for Scalping strategy
+   MA_Handle = iMA(_Symbol, PERIOD_M1, MA_Period, 0, MODE_SMA, PRICE_CLOSE);
+   BBHandle = iBands(_Symbol, Timeframe, BBPeriod, BBDeviation, 0, PRICE_CLOSE);
+   ATRHandle = iATR(_Symbol, Timeframe, ATR_Period);
+
+// Create text labels for the chart
+   ObjectCreate(ChartID(), "TrendLabel", OBJ_LABEL, 0, 0, 0);
+   ObjectCreate(ChartID(), "DBPatternLabel", OBJ_LABEL, 0, 0, 0);
+   ObjectCreate(ChartID(), "DTPatternLabel", OBJ_LABEL, 0, 0, 0);
+
+// Set initial positions for the text labels
+   ObjectSetInteger(ChartID(), "TrendLabel", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(ChartID(), "TrendLabel", OBJPROP_YDISTANCE, 10);
+   ObjectSetInteger(ChartID(), "DBPatternLabel", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(ChartID(), "DBPatternLabel", OBJPROP_YDISTANCE, 30);
+   ObjectSetInteger(ChartID(), "DTPatternLabel", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(ChartID(), "DTPatternLabel", OBJPROP_YDISTANCE, 50);
+
+   if(!adx.Create(_Symbol, Timeframe, 14))
+     {
+      Print("Failed to create ADX indicator.");
+      ExpertRemove();
+     }
+  }
+
+// OnTick()
+void OnTick()
+  {
+   trendFinderOnTick();
+   DBPatternOnTick();
+   DTPatternOnTick();
+
+// Update the global variables with the latest values from the custom indicators
+   dbPattern = getDBPattern();
+   dtPattern = getDTPattern();
+
+// Update the text labels with the current trend and pattern values
+   ObjectSetString(ChartID(), "TrendLabel", OBJPROP_TEXT, "Trend: " + getTrend());
+   ObjectSetString(ChartID(), "DBPatternLabel", OBJPROP_TEXT, "DB Pattern: " + getDBPattern());
+   ObjectSetString(ChartID(), "DTPatternLabel", OBJPROP_TEXT, "DT Pattern: " + getDTPattern());
+
+   double FastMA[], SlowMA[], RSI[];
+// Update FastMA, SlowMA, and RSI
+   CopyBuffer(FastMAHandle, 0, 0, FastMAPeriod, FastMA);
+   CopyBuffer(SlowMAHandle, 0, 0, SlowMAPeriod, SlowMA);
+   CopyBuffer(RSIHandle, 0, 0, RSI_Period, RSI);
+   CopyBuffer(BBHandle, 0, 0, BBPeriod, BBUpper);
+   CopyBuffer(BBHandle, 1, 0, BBPeriod, BBMiddle);
+   CopyBuffer(BBHandle, 2, 0, BBPeriod, BBLower);
+   CopyBuffer(ATRHandle, 0, 0, ATR_Period, ATR);
+
+   double Bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double Ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double stopLoss, takeProfit;
+   double adx_value = adx.Main(0);
+   double plus_di_value = adx.Plus(0);
+   double minus_di_value = adx.Minus(0);
+
+// Get the current bar index
+   int shift = 0;
+
+// Add these variables to track the highest and lowest RSI values within the lookback period
+   int RSI_Lookback = 10; // Define the lookback period for RSI
+   double HighestRSI = 0;
+   double LowestRSI = 1000;
+
+// Get the available RSI data count
+   int availableData = CopyBuffer(RSIHandle, 0, 0, RSI_Period, RSI);
+
+// Check if there's enough data for the lookback period
+   if(availableData >= RSI_Lookback + 1)
+     {
+      // Replace the original logic for updating MinRSI with the following:
+      for(int i = 1; i <= RSI_Lookback; i++)
+        {
+         if(RSI[i] > HighestRSI)
+           {
+            HighestRSI = RSI[i];
+           }
+         if(RSI[i] < LowestRSI)
+           {
+            LowestRSI = RSI[i];
+           }
+        }
+     }
+
+// Update the previous ATR value
+   PrevATR = ATR[1];
+
+      bool isUptrend = trend == "Uptrend";
+      bool isDowntrend = trend == "Downtrend";
+      bool isDoubleBottom = dbPattern == dbPattern;
+      bool isDoubleTop = dtPattern == dtPattern;
+      bool isADXHigh = adx_value > 55;
+      bool isAskAboveBB = Ask > BBUpper[0];
+      bool isBidBelowBB = Bid < BBLower[0];
+      bool isRSILower = RSI[0] < LowestRSI;
+      bool isRSIHigher = RSI[0] > HighestRSI;
+      bool isRSIOrATRHigher1 = RSI[1] > RSI[0] || ATR[1] > ATR[0];
+      bool isRSIOrATRHigher2 = RSI[1] < RSI[0] || ATR[1] > ATR[0];
+
+    if(isUptrend && isDoubleBottom && isADXHigh && isBidBelowBB && isRSILower && isRSIOrATRHigher1) 
+     {
+      if(!IsTradeAllowed() || IsTradeAlreadyOpen(ORDER_TYPE_BUY))
+         return;
+
+      // Calculate stop loss and take profit levels
+      stopLoss = Bid - (StopLossMultiplier * PrevATR);
+      takeProfit = Bid + (TakeProfitMultiplier * PrevATR);
+
+      // Place a Buy order
+
+      MqlTradeRequest buy_request;
+      MqlTradeResult buy_result;
+      ZeroMemory(buy_request);
+      buy_request.action = TRADE_ACTION_DEAL;
+      buy_request.symbol = _Symbol;
+      buy_request.type = ORDER_TYPE_BUY;
+      buy_request.volume = CalculatePositionSize(ORDER_TYPE_BUY); // Replace LotSize with the function call
+      buy_request.price = Ask;
+      buy_request.sl = stopLoss;
+      buy_request.tp = takeProfit;
+      buy_request.deviation = 10;
+      buy_request.magic = MagicNumber;
+      buy_request.comment = "Buy order";
+      buy_request.type_filling = ORDER_FILLING_FOK;
+
+      if(!OrderSend(buy_request, buy_result))
+        {
+         Print("OrderSend failed with error ", GetLastError());
+        }
+      else
+        {
+         Print("Buy order placed with ticket #", buy_result.order);
+        }
+
+      if(buy_result.retcode != TRADE_RETCODE_DONE)
+        {
+         Print("OrderSend failed with error ", GetLastError());
+        }
+      else
+        {
+         Print("Buy order placed with ticket #", buy_result.order);
+        }
+     }
+
+// Check for Sell signal
+   if(isDowntrend && isDoubleTop && isADXHigh && isAskAboveBB && isRSIHigher && isRSIOrATRHigher2) 
+  // Execute sell order
+     {
+      if(!IsTradeAllowed() || IsTradeAlreadyOpen(ORDER_TYPE_SELL))
+         return;
+
+      // Calculate stop loss and take profit levels
+      stopLoss = Ask + (StopLossMultiplier * PrevATR);
+      takeProfit = Ask - (TakeProfitMultiplier * PrevATR);
+
+      // Place a Sell order
+
+      MqlTradeRequest sell_request;
+      MqlTradeResult sell_result;
+      ZeroMemory(sell_request);
+      sell_request.action = TRADE_ACTION_DEAL;
+      sell_request.symbol = _Symbol;
+      sell_request.type = ORDER_TYPE_SELL;
+      sell_request.volume = CalculatePositionSize(ORDER_TYPE_SELL); // Replace LotSize with the function call
+      sell_request.price = Bid;
+      sell_request.sl = stopLoss;
+      sell_request.tp = takeProfit;
+      sell_request.deviation = 10;
+      sell_request.magic = MagicNumber;
+      sell_request.comment = "Sell order";
+      sell_request.type_filling = ORDER_FILLING_FOK;
+
+      if(!OrderSend(sell_request, sell_result))
+        {
+         Print("OrderSend failed with error ", GetLastError());
+        }
+      else
+        {
+         Print("Sell order placed with ticket #", sell_result.order);
+        }
+      if(sell_result.retcode != TRADE_RETCODE_DONE)
+        {
+         Print("OrderSend failed with error ", GetLastError());
+        }
+      else
+        {
+         Print("sell order placed with ticket #", sell_result.order);
+        }
+     }
+ // Call ModifyPositionStopLossAndTakeProfit() function
+   ModifyPositionStopLossAndTakeProfit();    
+
+// Close trades when trend changes
+   if(previous_trend != current_trend)
+     {
+      CloseAllPositions();
+     }
+
+// Update the previous trend
+   previous_trend = current_trend;
+
+// Trailing Stop
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket != 0 && PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+        {
+         double positionOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double currentPositionProfit = PositionGetDouble(POSITION_PROFIT);
+
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+           {
+            if(currentPositionProfit > 0 && (bid - positionOpenPrice) > TrailingStop * _Point)
+              {
+               double newStopLoss = NormalizeDouble(bid - TrailingStop * _Point, _Digits);
+               if(newStopLoss > PositionGetDouble(POSITION_SL))
+                 {
+                  MqlTradeRequest modifyRequest;
+                  MqlTradeResult modifyResult;
+                  ZeroMemory(modifyRequest);
+                  modifyRequest.action = TRADE_ACTION_SLTP;
+                  modifyRequest.symbol = _Symbol;
+                  modifyRequest.sl = newStopLoss;
+                  modifyRequest.tp = PositionGetDouble(POSITION_TP);
+                  modifyRequest.order = ticket;
+
+                  if(!OrderSendAsync(modifyRequest, modifyResult))
+                    {
+                     Print("OrderModify failed with error: ", GetLastError());
+                    }
+                 }
+              }
+           }
+         else
+            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+              {
+               if(currentPositionProfit > 0 && (positionOpenPrice - ask) > TrailingStop * _Point)
+                 {
+                  double newStopLoss = NormalizeDouble(ask + TrailingStop * _Point, _Digits);
+                  if(newStopLoss < PositionGetDouble(POSITION_SL) || PositionGetDouble(POSITION_SL) == 0)
+                    {
+                     MqlTradeRequest modifyRequest;
+                     MqlTradeResult modifyResult;
+                     ZeroMemory(modifyRequest);
+                     modifyRequest.action = TRADE_ACTION_SLTP;
+                     modifyRequest.symbol = _Symbol;
+                     modifyRequest.sl = newStopLoss;
+                     modifyRequest.tp = PositionGetDouble(POSITION_TP);
+                     modifyRequest.order = ticket;
+
+                     if(!OrderSendAsync(modifyRequest, modifyResult))
+                       {
+                        Print("OrderModify failed with error: ", GetLastError());
+                       }
+                    }
+                 }
+              }
+        }
+     }
+
+  }
+// Modify Stop Loss function
+void modifyStopLoss(ulong ticket, double newStopLoss)
+  {
+   MqlTradeRequest modifyRequest;
+   MqlTradeResult modifyResult;
+   ZeroMemory(modifyRequest);
+   modifyRequest.action = TRADE_ACTION_SLTP;
+   modifyRequest.symbol = _Symbol;
+   modifyRequest.sl = newStopLoss;
+   modifyRequest.tp = PositionGetDouble(POSITION_TP);
+   modifyRequest.order = ticket;
+
+   if(!OrderSendAsync(modifyRequest, modifyResult))
+     {
+      Print("OrderModify failed with error: ", GetLastError());
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void ModifyPositionStopLossAndTakeProfit()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket != 0 && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+        {
+         double stopLoss = PositionGetDouble(POSITION_SL);
+         double takeProfit = PositionGetDouble(POSITION_TP);
+         double newStopLoss, newTakeProfit;
+
+         if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+           {
+            newStopLoss = PositionGetDouble(POSITION_PRICE_OPEN) - StopLoss * _Point;
+            newTakeProfit = PositionGetDouble(POSITION_PRICE_OPEN) + TakeProfit * _Point;
+           }
+         else
+           {
+            newStopLoss = PositionGetDouble(POSITION_PRICE_OPEN) + StopLoss * _Point;
+            newTakeProfit = PositionGetDouble(POSITION_PRICE_OPEN) - TakeProfit * _Point;
+           }
+
+         if(stopLoss != newStopLoss || takeProfit != newTakeProfit)
+           {
+            MqlTradeRequest modify_request;
+            MqlTradeResult modify_result;
+
+            ZeroMemory(modify_request);
+
+            modify_request.action = TRADE_ACTION_SLTP; // Corrected action
+            modify_request.order = ticket;
+            modify_request.sl = newStopLoss;
+            modify_request.tp = newTakeProfit;
+
+            if(!OrderSend(modify_request, modify_result))
+              {
+               Print("Modify failed with error ", GetLastError());
+              }
+            else
+              {
+               Print("Position #", ticket, " SL/TP modified -> SL: ", newStopLoss, ", TP: ", newTakeProfit);
+              }
+           }
+        }
+     }
+  }
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double CalculatePositionSize(ENUM_ORDER_TYPE order_type)
+{
+   double risk_fraction = RiskPercentage / 100.0; // Convert risk percentage to decimal
+   double account_balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk_amount = account_balance * risk_fraction;
+   double stop_loss_pips = StopLossPips;
+
+   double pip_value = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double lot_size = risk_amount / (stop_loss_pips * pip_value);
+
+   // Adjust the lot size to respect symbol's limits and step size
+   double min_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   lot_size = MathMax(min_lot, MathMin(max_lot, lot_size));
+   int steps = (int)((lot_size - min_lot) / lot_step);
+   lot_size = min_lot + steps * lot_step;
+
+   return NormalizeDouble(lot_size, 2);
+}
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double CalculateStopLoss(ENUM_ORDER_TYPE order_type)
+{
+   double current_price = (order_type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double stop_loss_level = (order_type == ORDER_TYPE_BUY) ? (current_price - StopLoss * _Point) : (current_price + StopLoss * _Point);
+
+   return stop_loss_level;
+}
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double CalculateTakeProfit(ENUM_ORDER_TYPE order_type)
+{
+   double current_price = (order_type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double take_profit_level = (order_type == ORDER_TYPE_BUY) ? (current_price + TakeProfit * _Point) : (current_price - TakeProfit * _Point);
+
+   return take_profit_level;
+}
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double CalculateProfitStopLoss(ENUM_ORDER_TYPE order_type, double currentPositionProfit)
+{
+   double current_price = (order_type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double profit_stop_loss_level = (order_type == ORDER_TYPE_BUY) ? (current_price - ProfitStopLoss * _Point) : (current_price + ProfitStopLoss * _Point);
+
+   return profit_stop_loss_level;
+}
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+        {
+         if(_Symbol == PositionGetString(POSITION_SYMBOL))
+           {
+            MqlTradeRequest request;
+            MqlTradeResult result;
+            ZeroMemory(request);
+
+            request.action = TRADE_ACTION_DEAL;
+            request.order = ticket;
+            request.symbol = _Symbol;
+            request.volume = PositionGetDouble(POSITION_VOLUME);
+            request.type_filling = ORDER_FILLING_FOK;
+
+            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+              {
+               request.type = ORDER_TYPE_SELL;
+               request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+              }
+            else
+              {
+               request.type = ORDER_TYPE_BUY;
+               request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+              }
+
+            request.deviation = 10;
+
+            if(!OrderSend(request, result))
+              {
+               Print("OrderSend failed with error: ", GetLastError());
+              }
+            else
+              {
+               Print("Closed position with ticket #", result.order);
+              }
+           }
+        }
+     }
+  }
+//+------------------------------------------------------------------+
